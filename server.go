@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,10 @@ type FILE_ACTION string
 const (
 	ACTION_DELETE FILE_ACTION = "DELETE"
 	ACTION_GET    FILE_ACTION = "GET"
+)
+
+const (
+	FILE_NOT_FOUND int64 = -1
 )
 
 type FileServerOpts struct {
@@ -117,10 +122,15 @@ func (s *FileServer) Get(key string) (io.Reader, error) {
 
 	time.Sleep(time.Millisecond * 500)
 
+	var filesize int64
 	for _, peer := range s.peers {
 
-		var filesize int64
 		binary.Read(peer, binary.LittleEndian, &filesize)
+
+		if filesize == -1 {
+			log.Printf("file not found on server [%s]\n", peer.LocalAddr())
+			continue
+		}
 
 		n, err := s.store.writeDecrypt(s.EncKey, key, io.LimitReader(peer, filesize))
 		if err != nil {
@@ -129,6 +139,10 @@ func (s *FileServer) Get(key string) (io.Reader, error) {
 		}
 		log.Printf("[%s] received bytes over the network %d from [%s]\n", s.Transport.ListenAddr(), n, peer.LocalAddr())
 		peer.CloseStream()
+	}
+
+	if filesize == -1 {
+		return nil, errors.New("key does not exist in network")
 	}
 
 	_, r, err := s.store.Read(key)
@@ -181,12 +195,7 @@ func (s *FileServer) loop() {
 func (s *FileServer) OnPeer(p p2p.Peer, outbound bool) error {
 	s.peerLock.Lock()
 	defer s.peerLock.Unlock()
-
-	if outbound {
-		s.peers[p.RemoteAddr().String()] = p
-	} else {
-		s.peers[p.LocalAddr().String()] = p
-	}
+	s.peers[p.RemoteAddr().String()] = p
 	log.Printf("current local peer: %+v, current remote peer: %+v\n", p.LocalAddr(), p.RemoteAddr())
 	// log.Printf("connected with remote: %s\n", p.LocalAddr().String())
 
@@ -323,7 +332,13 @@ func (s *FileServer) handleMessageFileKey(from string, msg MessageFileKey) error
 	switch msg.Action {
 
 	case "GET":
+		peer, ok := s.peers[from]
+		if !ok {
+			return fmt.Errorf("peer [%s] does not exist in peer map", from)
+		}
 		if !s.store.Has(msg.Key) {
+			peer.Send([]byte{p2p.IncomingStream})
+			binary.Write(peer, binary.LittleEndian, FILE_NOT_FOUND)
 			return fmt.Errorf("[%s] need to serve file (%s) but it does not exist on disk", s.Transport.ListenAddr(), msg.Key)
 		}
 
@@ -337,11 +352,6 @@ func (s *FileServer) handleMessageFileKey(from string, msg MessageFileKey) error
 		if rc, ok := r.(io.ReadCloser); ok {
 			log.Println("closing file...")
 			defer rc.Close()
-		}
-
-		peer, ok := s.peers[from]
-		if !ok {
-			return fmt.Errorf("peer [%s] does not exist in peer map", from)
 		}
 
 		peer.Send([]byte{p2p.IncomingStream})
