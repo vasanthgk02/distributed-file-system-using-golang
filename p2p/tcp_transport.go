@@ -103,46 +103,50 @@ func (t *TCPTransport) Dail(addr string) error {
 }
 
 func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
-	log.Println("new conn triggered!")
+	log.Printf("new connection from %s (outbound: %v)\n", conn.RemoteAddr(), outbound)
 
 	var err error
 
 	defer func() {
-		log.Printf("dropping peer connection: %s\n", err)
+		if err != nil {
+			log.Printf("dropping peer connection %s: %v\n", conn.RemoteAddr(), err)
+		} else {
+			log.Printf("peer connection %s closed gracefully\n", conn.RemoteAddr())
+		}
 		conn.Close()
 	}()
 
 	peer := NewTCPPeer(conn, outbound)
 
 	if err = t.HandShakeFunc(peer); err != nil {
+		log.Printf("handshake failed with %s: %v\n", conn.RemoteAddr(), err)
 		return
 	}
 
 	if t.OnPeer != nil {
 		if err = t.OnPeer(peer, outbound); err != nil {
+			log.Printf("OnPeer callback failed for %s: %v\n", conn.RemoteAddr(), err)
 			return
 		}
-	} else {
-		log.Println("onPeer is nil")
 	}
 
+	// Message processing loop
 	for {
 		rpc := RPC{}
-		rpc.From = conn.LocalAddr()
+		rpc.From = conn.RemoteAddr() // Use RemoteAddr for better identification
+
 		if err = t.Decoder.Decode(conn, &rpc); err != nil {
-			// log.Println(reflect.TypeOf(err))
-			// panic(err)
-			log.Printf("TCP error: %s\n", err)
+			log.Printf("decode error from %s: %v\n", conn.RemoteAddr(), err)
 			return
 		}
 
-		log.Printf("Decoded msg from conn. Sending same msg into chann: %+v\n", rpc)
-		if rpc.Stream {
+		log.Printf("decoded message from %s: stream=%v\n", conn.RemoteAddr(), rpc.Stream)
 
+		if rpc.Stream {
 			peer.wg.Add(1)
-			log.Printf("[%s] incoming stream, waiting...\n", conn.LocalAddr())
+			log.Printf("[%s] incoming stream, waiting...\n", conn.RemoteAddr())
 			peer.wg.Wait()
-			log.Printf("[%s] stream closed, resuming read loop\n", conn.LocalAddr())
+			log.Printf("[%s] stream closed, resuming read loop\n", conn.RemoteAddr())
 			continue
 		}
 		t.rpcch <- rpc
